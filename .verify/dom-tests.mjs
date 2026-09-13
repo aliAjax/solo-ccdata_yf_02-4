@@ -40,13 +40,13 @@ const downloads = [];
 const pageErrors = [];
 let tabSeq = 0;
 
-function makeTab({ width = 1280, sessionMap = new Map() } = {}) {
+function makeTab({ width = 1280, sessionMap = new Map(), url = 'http://127.0.0.1:8099/index.html?rbtest=1' } = {}) {
   const html = injectApp(html0);
   const vc = new VirtualConsole();
   vc.on('jsdomError', e => pageErrors.push(e.message));
   const dom = new JSDOM(html, {
     runScripts: 'dangerously',
-    url: 'http://127.0.0.1:8099/index.html',
+    url,
     width, height: 900,
     pretendToBeVisual: true,
     virtualConsole: vc,
@@ -196,6 +196,48 @@ check('审计含创建/推进/归档关键记录', auditTxt.includes('创建评�
 check('审计含意见状态流转', auditTxt.includes('核验中 → 通过'));
 check('审计含成员加入记录', auditTxt.includes('以观察者身份加入') || auditTxt.includes('以编辑者身份加入'));
 
+/* ---------- 5b. 越权攻击（调试接口 + 伪造总线消息） ---------- */
+// 普通访问不挂载 __rb
+{
+  const plain = makeTab({ url: 'http://127.0.0.1:8099/index.html' });
+  check('普通访问不暴露调试接口 __rb', plain.w.eval(`typeof window.__rb`) === 'undefined');
+}
+const attackCmt = A.w.eval(`__rb.addComment('安全测试意见',{priority:'medium'})`);
+await waitFor(() => C.w.eval(`Object.keys(__rb.state.comments).length`) === 2);
+const cObserverId = C.w.eval(`__rb.meId`);
+C.w.eval(`__rb.setStatus(${JSON.stringify(attackCmt)},'approved')`);
+check('观察者 setStatus 被拒', C.$('#toast').textContent.includes('观察者'));
+check('意见状态不变', A.w.eval(`__rb.state.comments[${JSON.stringify(attackCmt)}].status`) === 'open');
+check('观察者 addComment 被拒（null）', C.w.eval(`__rb.addComment('偷提')`) === null);
+C.w.eval(`__rb.setRole('host')`);
+check('观察者 setRole 提权被拒', C.$('#toast').textContent.includes('仅主持人'));
+check('身份仍为观察者', A.w.eval(`__rb.state.members[${JSON.stringify(cObserverId)}].role`) === 'observer');
+check('观察者 addMember 被拒（null）', C.w.eval(`__rb.addMember('内鬼','host')`) === null);
+C.w.eval(`__rb.openConflict()`);
+check('观察者裁决冲突被拒', C.$('#toast').textContent.includes('仅主持人'));
+// 伪造底层补丁
+const aHostId2 = A.w.eval(`__rb.meId`);
+C.w.eval(`(function(p){
+  const ch = new BroadcastChannel('rb.channel.'+__rb.state.id);
+  ch.postMessage({kind:'patch',session:'evil1',ts:Date.now(),by:__rb.meId,byName:'赵观察',patchType:'member-role',snapshot:{members:{[__rb.meId]:{...__rb.state.members[__rb.meId],role:'host'}}}});
+  ch.postMessage({kind:'patch',session:'evil2',ts:Date.now(),by:__rb.meId,byName:'赵观察',patchType:'member-remove',snapshot:{members:{[p.hid]:{id:p.hid,removed:true}}}});
+  ch.postMessage({kind:'patch',session:'evil3',ts:Date.now(),by:__rb.meId,byName:'赵观察',patchType:'object-update',objectId:'evil',baseTag:'b',verTag:'v',proposed:{id:'evil'},snapshot:{objects:{evil:{id:'evil',type:'note',x:1,y:1,text:'伪造',verTag:'v'}}}});
+  ch.postMessage({kind:'patch',session:'evil4',ts:Date.now(),by:__rb.meId,byName:'赵观察',patchType:'state',snapshot:{commentTombstones:[p.cid]}});
+  ch.postMessage({kind:'patch',session:'stranger',ts:Date.now(),by:'mb-ghost',byName:'陌生人',patchType:'state',snapshot:{comments:{[p.cid]:{id:p.cid,status:'approved'}}}});
+})(${JSON.stringify({ cid: attackCmt, hid: aHostId2 })})`);
+await sleep(300);
+check('伪造提权补丁被丢弃', A.w.eval(`__rb.state.members[${JSON.stringify(cObserverId)}].role`) === 'observer');
+check('伪造移除主持人补丁被丢弃', A.w.eval(`!!__rb.state.members[${JSON.stringify(aHostId2)}]`) === true);
+check('伪造对象补丁被丢弃', A.w.eval(`!__rb.state.objects.evil`) === true);
+check('伪造删除意见补丁被丢弃', A.w.eval(`!!__rb.state.comments[${JSON.stringify(attackCmt)}]`) === true);
+check('未知发送者补丁被丢弃', A.w.eval(`__rb.state.comments[${JSON.stringify(attackCmt)}].status`) === 'open');
+// 编辑者权限边界：不能管理成员（改他人角色）、不能裁决
+{
+  const editorId = B.w.eval(`__rb.meId`);
+  B.w.eval(`__rb.setRole('host')`);
+  check('编辑者不能自行提权', B.$('#toast').textContent.includes('仅主持人') && A.w.eval(`__rb.state.members[${JSON.stringify(editorId)}].role`) === 'editor');
+}
+
 /* ---------- 6. 冲突裁决 ---------- */
 A.w.eval(`while(__rb.state.stage!=='collect')__rb.backStage();`);
 await sleep(200);
@@ -284,7 +326,7 @@ A2.w.eval(`boot && boot()`);
 await waitFor(() => !A2.$('#app').hidden);
 const restored = A2.w.eval(`JSON.stringify({stage:__rb.state.stage,obj:Object.keys(__rb.state.objects).length,cmt:Object.keys(__rb.state.comments).length,merged:__rb.state.objects[${JSON.stringify(oid2)}]?.text,role:document.querySelector('#me-badge').textContent})`);
 const r = JSON.parse(restored);
-check('刷新后恢复阶段/画板/意见/合并结果/身份', r.stage === 'collect' && r.obj >= 3 && r.cmt === 1 && r.merged === '合并结论：采用 A 的结构 + B 的措辞' && r.role.includes('王主持'), restored);
+check('刷新后恢复阶段/画板/意见/合并结果/身份', r.stage === 'collect' && r.obj >= 3 && r.cmt === 2 && r.merged === '合并结论：采用 A 的结构 + B 的措辞' && r.role.includes('王主持'), restored);
 
 // 退出 → 从入口记录重开
 click(A2, '#exit');

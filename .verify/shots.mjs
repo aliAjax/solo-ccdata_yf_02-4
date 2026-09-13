@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1360, height: 900 } });
 const p = await ctx.newPage();
-await p.goto('http://127.0.0.1:8099/index.html');
+await p.goto('http://127.0.0.1:8099/index.html?rbtest=1');
 await p.fill('#cr-title', '首页改版方案评审');
 await p.fill('#cr-name', '王主持');
 await p.click('#createForm button.primary');
@@ -25,7 +25,7 @@ await p.screenshot({ path: '/workspace/.verify/shot-conflict.png' });
 // 窄屏
 const m = await ctx.newPage();
 await m.setViewportSize({width:390,height:844});
-await m.goto('http://127.0.0.1:8099/index.html');
+await m.goto('http://127.0.0.1:8099/index.html?rbtest=1');
 await m.fill('#cr-title','移动端评审'); await m.fill('#cr-name','周主持');
 await m.click('#createForm button.primary');
 await m.evaluate(()=>__rb.addComment('窄屏意见'));

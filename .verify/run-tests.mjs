@@ -1,7 +1,8 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
 
-const BASE = 'http://127.0.0.1:8099/index.html';
+const BASE = 'http://127.0.0.1:8099/index.html?rbtest=1';
+const BASE_PLAIN = 'http://127.0.0.1:8099/index.html';
 const results = [];
 function check(name, cond, extra = '') {
   results.push({ name, ok: !!cond, extra });
@@ -76,6 +77,7 @@ check('观察者推进阶段被拒', toastObs.includes('仅主持人'));
 // 观察者仍可导出
 const obsCanExport = await c.$eval('#export', el => !el.disabled);
 check('观察者可以导出 PNG', obsCanExport);
+
 
 // 编辑者：可以放元素（通过真实点击画板）
 const bb = await b.locator('#board').boundingBox();
@@ -166,6 +168,87 @@ await a.click('.rtab[data-rtab="audit"]');
 const auditTxt = await a.textContent('#auditList');
 check('审计含创建/推进/归档/身份等关键记录', auditTxt.includes('创建评审') && auditTxt.includes('阶段推进') && auditTxt.includes('归档'));
 check('审计含意见状态变更记录', auditTxt.includes('状态：核验中 → 通过'));
+
+/* ---------- 5b. 越权攻击：调试接口 / 伪造消息都不能提权或改数据 ---------- */
+// 普通访问（无 ?rbtest=1）根本不存在调试接口
+const plain = await context.newPage();
+await plain.goto(BASE_PLAIN);
+check('普通访问不暴露调试接口 __rb', await plain.evaluate(() => typeof window.__rb === 'undefined'));
+await plain.close();
+
+// 观察者通过调试接口尝试：改意见状态（先由主持人再造一条意见）
+const commentsBeforeAttack = await c.evaluate(() => Object.keys(__rb.state.comments).length);
+const attackCmt = await a.evaluate(() => __rb.addComment('安全测试意见', { priority: 'medium' }));
+await waitFor(async () => (await c.evaluate(() => Object.keys(__rb.state.comments).length)) === commentsBeforeAttack + 1, { timeout: 4000 });
+const cRoleBefore = await c.evaluate(() => __rb.state.members[__rb.meId].role);
+await c.evaluate(id => __rb.setStatus(id, 'approved'), attackCmt);
+check('观察者调用 setStatus 改意见状态被拒', (await c.textContent('#toast')).includes('观察者'));
+check('意见状态保持待处理', await a.evaluate(id => __rb.state.comments[id].status, attackCmt) === 'open');
+
+// 观察者尝试提交意见（调试接口）
+const beforeCmtN = await a.evaluate(() => Object.keys(__rb.state.comments).length);
+const observerCmt = await c.evaluate(() => __rb.addComment('观察者偷提意见'));
+check('观察者 addComment 返回 null（被拒）', observerCmt === null);
+await sleep(200);
+check('观察者没有产生新意见', await a.evaluate(() => Object.keys(__rb.state.comments).length) === beforeCmtN);
+
+// 观察者尝试把自己提升为主持人
+await c.evaluate(() => __rb.setRole('host'));
+check('观察者 setRole 提权被拒', (await c.textContent('#toast')).includes('仅主持人'));
+const observerId = await c.evaluate(() => __rb.meId);
+check('观察者身份仍为观察者', await a.evaluate(id => __rb.state.members[id].role, observerId) === 'observer');
+
+// 观察者尝试添加成员 / 裁决冲突 / 推进阶段（调试接口）
+const memBefore = await a.evaluate(() => Object.keys(__rb.state.members).length);
+check('观察者 addMember 被拒（返回 null）', await c.evaluate(() => __rb.addMember('内鬼', 'host')) === null);
+await sleep(150);
+check('未新增成员', await a.evaluate(() => Object.keys(__rb.state.members).length) === memBefore);
+await c.evaluate(() => __rb.resolve && __rb.resolve('A'));
+check('观察者直接 resolve 冲突被拒', (await c.textContent('#toast')).includes('仅主持人'));
+
+// 观察者伪造底层补丁：自封主持人的 member-role / member-remove / 改对象 / 删意见
+await c.evaluate(({ cid, hid }) => {
+  const ch = new BroadcastChannel('rb.channel.' + __rb.state.id);
+  // 自封主持人
+  ch.postMessage({ kind: 'patch', session: 'evil1', ts: Date.now(), by: __rb.meId, byName: '赵观察', patchType: 'member-role', snapshot: { members: { [__rb.meId]: { ...__rb.state.members[__rb.meId], role: 'host' } } } });
+  // 踢掉主持人
+  ch.postMessage({ kind: 'patch', session: 'evil2', ts: Date.now(), by: __rb.meId, byName: '赵观察', patchType: 'member-remove', snapshot: { members: { [hid]: { id: hid, removed: true } } } });
+  // 改画板对象（若有）
+  ch.postMessage({ kind: 'patch', session: 'evil3', ts: Date.now(), by: __rb.meId, byName: '赵观察', patchType: 'object-update', objectId: 'x', baseTag: 'b', verTag: 'v', proposed: { id: 'x' }, snapshot: { objects: { evil: { id: 'evil', type: 'note', x: 1, y: 1, text: '观察者伪造', verTag: 'v' } } } });
+  // 删除意见
+  ch.postMessage({ kind: 'patch', session: 'evil4', ts: Date.now(), by: __rb.meId, byName: '赵观察', patchType: 'state', snapshot: { commentTombstones: [cid] } });
+}, { cid: attackCmt, hid: await a.evaluate(() => __rb.meId) });
+await sleep(400);
+check('伪造 member-role 被丢弃（观察者未提权）', await a.evaluate(() => Object.values(__rb.state.members).find(m => m.name === '赵观察').role) === 'observer');
+check('伪造 member-remove 被丢弃（主持人仍在）', await a.evaluate(id => !!__rb.state.members[id], await a.evaluate(() => __rb.meId)));
+check('伪造对象补丁被丢弃（无 evil 对象）', await a.evaluate(() => !__rb.state.objects.evil));
+check('伪造意见删除被丢弃（意见仍在）', await a.evaluate(id => !!__rb.state.comments[id], attackCmt));
+
+// 未知发送者的补丁同样被丢弃
+await a.evaluate(cid => {
+  const ch = new BroadcastChannel('rb.channel.' + __rb.state.id);
+  ch.postMessage({ kind: 'patch', session: 'stranger', ts: Date.now(), by: 'mb-nonexistent', byName: '陌生人', patchType: 'state', snapshot: { comments: { [cid]: { id: cid, status: 'approved' } } } });
+}, attackCmt);
+await sleep(300);
+check('未知发送者补丁被丢弃', await a.evaluate(id => __rb.state.comments[id].status, attackCmt) === 'open');
+check('观察者本人身份在 C 标签也未变', cRoleBefore === 'observer');
+
+/* ---------- 5c. 编辑者权限边界：不能裁决/管理成员/推进阶段/删除他人意见 ---------- */
+await b.evaluate(() => __rb.advance());
+check('编辑者直接调用推进被拒', (await b.textContent('#toast')).includes('仅主持人'));
+check('阶段未被编辑者改变', await a.evaluate(() => __rb.state.stage) === 'decide');
+await b.evaluate(() => __rb.resolve('A'));
+check('编辑者直接裁决被拒', (await b.textContent('#toast')).includes('仅主持人'));
+check('编辑者 addMember 被拒（返回 null）', await b.evaluate(() => __rb.addMember('内鬼编辑', 'host')) === null);
+const commentsBeforeDel = await a.evaluate(() => Object.keys(__rb.state.comments).length);
+// 编辑者伪造删除主持人意见的 commentTombstone 补丁，应被入站授权丢弃
+await b.evaluate(cid => {
+  const ch = new BroadcastChannel('rb.channel.' + __rb.state.id);
+  ch.postMessage({ kind: 'patch', session: 'ed-evil', ts: Date.now(), by: __rb.meId, byName: '李编辑', patchType: 'state', snapshot: { commentTombstones: [cid] } });
+}, attackCmt);
+await sleep(300);
+check('编辑者伪造删除他人意见被丢弃', await a.evaluate(id => !!__rb.state.comments[id], attackCmt) === true);
+check('意见总数未变', await a.evaluate(() => Object.keys(__rb.state.comments).length) === commentsBeforeDel);
 
 /* ---------- 6. 冲突裁决 ---------- */
 // 回到收集阶段以便继续编辑（主持人回退到收集）
@@ -260,7 +343,7 @@ const restored = await a.evaluate(([id, t]) => ({
   merged: __rb.state.objects[id]?.text === t,
   role: document.querySelector('#me-badge').textContent,
 }), [oid2, '合并结论：采用 A 的结构 + B 的措辞']);
-check('刷新后恢复评审/阶段/画板/意见/身份', restored.stage === 'collect' && restored.objCount >= 3 && restored.cmtCount === 1 && restored.merged && restored.role.includes('主持人'), JSON.stringify(restored));
+check('刷新后恢复评审/阶段/画板/意见/身份', restored.stage === 'collect' && restored.objCount >= 3 && restored.cmtCount === 2 && restored.merged && restored.role.includes('主持人'), JSON.stringify(restored));
 
 // 退出到入口页，从本机记录重开
 await a.click('#exit');

@@ -50,6 +50,7 @@ let busSupported = false;
 let tool = 'note', color = 'yellow', selectedId = null, statusFilter = 'all';
 let undoStack = [];
 let sessions = new Set([SESSION]);
+const sessionLastSeen = { [SESSION]: Date.now() };
 let currentConflictId = null;
 let editingCommentId = null;
 let pendingEvidence = null;
@@ -61,6 +62,11 @@ const canEditBoard = () => (myRole() === 'host' || myRole() === 'editor') && sta
 const canComment = () => (myRole() === 'host' || myRole() === 'editor') && state.stage !== 'archive';
 const isHost = () => myRole() === 'host';
 const memberColor = id => COLORS[(id || '').split('').reduce((a, c) => a + c.charCodeAt(0), 0) % COLORS.length];
+/* 统一拒绝：界面与调试接口（window.__rb）走同一套鉴权，无法绕过 */
+function deny(reason) { toast(reason); return false; }
+function denyBoard() { return deny(state.stage === 'archive' ? '归档阶段为只读，不能修改画板' : '观察者只能查看，不能修改画板'); }
+function denyComment() { return deny(state.stage === 'archive' ? '归档阶段为只读，不能操作意见' : '观察者只能查看，不能操作意见'); }
+function denyHost(action) { return deny(`仅主持人可以${action}`); }
 
 /* ---------------- 状态合并 ---------------- */
 function mergeState(remote) {
@@ -123,17 +129,24 @@ function connectBus() {
     bus.onmessage = ev => {
       const m = ev.data;
       if (m.session === SESSION) return;
-      sessions.add(m.session);
       if (m.kind === 'heartbeat' || m.kind === 'hello' || m.kind === 'hi') {
-        if (m.snapshot) { mergeState(m.snapshot); saveReview(state); renderPeople(); }
+        sessions.add(m.session);
+        sessionLastSeen[m.session] = Date.now();
+        // presence 消息只更新在线时间，绝不接受其中夹带的身份/角色变更
+        if (m.snapshot?.members) for (const id of Object.keys(m.snapshot.members)) {
+          if (state.members[id]) state.members[id].lastSeen = Math.max(state.members[id].lastSeen || 0, m.ts || Date.now());
+        }
+        saveReview(state); renderPeople();
         if (m.kind === 'hello') post({ kind: 'hi', snapshot: presenceSnapshot() });
+        pruneSessions();
         updateSync(); return;
       }
-      if (m.kind === 'bye') { sessions.delete(m.session); updateSync(); return; }
+      if (m.kind === 'bye') { sessions.delete(m.session); delete sessionLastSeen[m.session]; updateSync(); return; }
       if (m.kind === 'patch') handlePatch(m);
     };
     window.addEventListener('beforeunload', () => post({ kind: 'bye' }));
     setInterval(() => post({ kind: 'heartbeat', snapshot: presenceSnapshot() }), 5000);
+    setInterval(pruneSessions, 6000);
   }
   setInterval(() => { if (state && me()) { state.members[meId].lastSeen = Date.now(); saveReview(state); renderPeople(); } }, 8000);
 }
@@ -144,7 +157,7 @@ function baseSnapshot() {
   s.objects = {}; s.objectTombstones = []; s.objectRestores = [];
   s.comments = {}; s.commentTombstones = [];
   s.conflicts = []; s.conflictTombstones = [];
-  s.members = me() ? { [meId]: me() } : {};
+  s.members = {};   // 业务补丁不携带成员；成员变更必须走 member-join / member-role / member-remove
   s.audit = state.audit.slice(0, 3);
   delete s.stage;   // 阶段只随专门的阶段补丁传播，避免旧快照把阶段回退
   return s;
@@ -153,7 +166,51 @@ function presenceSnapshot() {
   const s = baseSnapshot(); s.audit = []; return s;
 }
 
+/* 入站补丁授权：按发送者在本端已知的角色判定，无权限的补丁直接丢弃
+   （即使有人通过调试接口手工 postMessage 伪造补丁也无法提权或改数据） */
+function authorizePatch(m) {
+  const snap = m.snapshot || {};
+  const sender = state.members[m.by];
+  const hasObjects = Object.keys(snap.objects || {}).length > 0 || (snap.objectTombstones || []).length > 0 || (snap.objectRestores || []).length > 0;
+  const hasComments = Object.keys(snap.comments || {}).length > 0 || (snap.commentTombstones || []).length > 0;
+  const hasMembers = Object.keys(snap.members || {}).length > 0;
+  const hasConflict = (snap.conflicts || []).length > 0 || (snap.conflictTombstones || []).length > 0;
+  const role = sender?.role;
+  const editor = role === 'host' || role === 'editor';
+  const archived = state.stage === 'archive';
+
+  if (m.patchType === 'member-join') {
+    // 自介绍：允许一个尚不存在的成员（首次握手），或已知成员重发；不能自封主持人
+    const [id, mm] = Object.entries(snap.members || {})[0] || [];
+    const known = state.members[id];
+    const roleOk = mm.role === 'editor' || mm.role === 'observer';
+    if (id !== m.by || !mm || mm.removed || !roleOk) return false;
+    if (known) return known.role === mm.role || known.role === 'host';  // 已有记录时不能借握手改身份
+    return true;
+  }
+  if (!sender) return false;                       // 未知发送者
+  if (m.patchType === 'member-role' || m.patchType === 'member-remove') return role === 'host';
+  if (m.patchType === 'conflict-resolve') return role === 'host';
+  if (archived && (hasObjects || hasComments)) return false;
+  if (m.patchType === 'object-update' || m.patchType === 'object-delete') return editor;
+  if (m.patchType === 'conflict-detected') return editor;
+  if (hasComments) {
+    if (!editor) return false;
+    if ((snap.commentTombstones || []).length) {   // 删除意见：本人或主持人
+      const id = snap.commentTombstones[0];
+      return role === 'host' || state.comments[id]?.by === m.by;
+    }
+    return true;
+  }
+  if (hasMembers) return false;                    // 成员变更只能走上面的专用类型
+  if (hasObjects) return editor;
+  if (hasConflict) return editor;
+  // 纯审计类 state 补丁：只有主持人（如被门禁阻止的推进尝试）
+  return role === 'host';
+}
+
 function handlePatch(m) {
+  if (!authorizePatch(m)) { console.warn('丢弃无权限的同步补丁', m.patchType, m.byName); return; }
   if (m.patchType === 'object-update' && m.verTag && m.baseTag !== m.verTag) {
     const cur = state.objects[m.objectId];
     const divergent = cur && cur.verTag !== m.verTag && cur.verTag !== m.baseTag;
@@ -290,6 +347,10 @@ function joinReview(id, name, role) {
     `${name} 以${ROLE[role]}身份加入评审`, true);
   sessionStorage.setItem(SS_ME + id, memberId);
   connectBus();
+  // 自介绍：只能以编辑者/观察者身份加入，主持人身份只能由现有主持人授予
+  const snap = baseSnapshot();
+  snap.members = { [memberId]: state.members[memberId] };
+  post({ kind: 'patch', patchType: 'member-join', by: memberId, byName: name, snapshot: snap });
   post({ kind: 'hello', snapshot: presenceSnapshot() });
   location.hash = '#room=' + id;
   showApp();
@@ -419,7 +480,7 @@ function makeObject(type, x, y) {
   };
 }
 function placeObject(x, y) {
-  if (!canEditBoard()) return;
+  if (!canEditBoard()) return denyBoard();
   const o = makeObject(tool, x, y);
   undoStack.push({ kind: 'add', id: o.id });
   commit(s => { s.objects[o.id] = o; });
@@ -428,6 +489,7 @@ function placeObject(x, y) {
 }
 function updateObjectText(id, text) {
   const cur = state.objects[id];
+  if (!canEditBoard()) return denyBoard();
   if (!cur || blockedByConflict(id)) return;
   const baseTag = cur.verTag;
   const updated = { ...cur, text, version: cur.version + 1, verTag: uid('v'), updatedBy: meId, updatedTs: Date.now() };
@@ -437,6 +499,7 @@ function updateObjectText(id, text) {
 }
 function deleteObject(id) {
   const cur = state.objects[id];
+  if (!canEditBoard()) return denyBoard();
   if (!cur || blockedByConflict(id)) return;
   undoStack.push({ kind: 'delete', obj: structuredClone(cur) });
   commit(s => { delete s.objects[id]; if (!s.objectTombstones.includes(id)) s.objectTombstones.push(id); });
@@ -451,7 +514,8 @@ function blockedByConflict(id) {
   return false;
 }
 function undo() {
-  if (!canEditBoard() || !undoStack.length) return;
+  if (!canEditBoard()) return denyBoard();
+  if (!undoStack.length) return;
   const act = undoStack.pop();
   if (act.kind === 'add') {
     const cur = state.objects[act.id]; if (!cur) return;
@@ -528,6 +592,7 @@ function renderComments() {
 }
 
 function changeStatus(c, next) {
+  if (!canComment()) return denyComment();
   const allowed = { open: ['reviewing'], reviewing: ['approved', 'rejected', 'open'], approved: ['reviewing'], rejected: ['reviewing'] };
   if (!allowed[c.status]?.includes(next)) { toast(`不能从「${STATUS[c.status]}」直接变为「${STATUS[next]}」`); renderComments(); return; }
   const from = c.status;
@@ -567,6 +632,7 @@ function openCommentModal(id) {
 function saveComment() {
   const content = $('#cm-content').value.trim();
   if (!content) return toast('请填写意见内容');
+  if (!canComment()) return denyComment();
   const id = editingCommentId || uid('cm');
   const old = state.comments[id];
   let nextStatus = old ? $('#cm-status').value : 'open';
@@ -593,13 +659,20 @@ function saveComment() {
   closeModal('#commentModal');
   toast(old ? '意见已更新' : '意见已提交');
 }
-function deleteComment() {
-  const id = editingCommentId; if (!id) return;
+function removeCommentById(id) {
   const c = state.comments[id];
-  if (!confirm('确认删除该意见？')) return;
+  if (!c) return false;
+  if (!canComment()) { denyComment(); return false; }
+  if (!(isHost() || c.by === meId)) { denyHost('删除他人意见'); return false; }
   commit(s => { delete s.comments[id]; if (!s.commentTombstones.includes(id)) s.commentTombstones.push(id); },
     `删除意见「${(c.content || '').slice(0, 16)}…」`, true);
   pushStatePatch({ commentId: id, commentTombstone: true });
+  return true;
+}
+function deleteComment() {
+  const id = editingCommentId; if (!id) return;
+  if (!confirm('确认删除该意见？')) return;
+  if (!removeCommentById(id)) return;
   closeModal('#commentModal');
 }
 
@@ -618,7 +691,7 @@ function renderAudit() {
 
 /* ---------- 冲突裁决 ---------- */
 function openConflict(cf) {
-  if (!isHost()) return toast('冲突由主持人裁决');
+  if (!isHost()) return denyHost('裁决冲突');
   currentConflictId = cf.id;
   const A = cf.versionA, B = cf.versionB;
   const hasText = A.type === 'note' || A.type === 'text';
@@ -633,6 +706,7 @@ function openConflict(cf) {
   openModal('#conflictModal');
 }
 function resolveConflict(pick) {
+  if (!isHost()) return denyHost('裁决冲突');
   const cf = state.conflicts.find(c => c.id === currentConflictId);
   if (!cf) return;
   const A = cf.versionA, B = cf.versionB;
@@ -690,16 +764,18 @@ function openMembers() {
   openModal('#membersModal');
 }
 function changeRole(m, role, sel) {
+  if (!isHost()) return denyHost('管理成员身份');
   if (m.role === 'host' && role !== 'host' && Object.values(state.members).filter(x => x.role === 'host').length <= 1) {
     toast('至少保留一位主持人'); sel.value = 'host'; return;
   }
   const old = m.role;
   commit(s => { s.members[m.id].role = role; }, `成员身份变更：${m.name} ${ROLE[old]} → ${ROLE[role]}`, true);
-  pushStatePatch({ members: { [m.id]: state.members[m.id] } });
+  pushStatePatch({ members: { [m.id]: state.members[m.id] }, patchType: 'member-role' });
   toast(`${m.name} 的身份已更新为${ROLE[role]}`);
   openMembers();
 }
 function removeMember(m) {
+  if (!isHost()) return denyHost('移除成员');
   if (!confirm(`确认将 ${m.name} 移出评审？`)) return;
   commit(s => { delete s.members[m.id]; }, `移除成员：${m.name}（原${ROLE[m.role]}）`, true);
   const snap = baseSnapshot();
@@ -779,6 +855,13 @@ function updateSync() {
   const s = $('#sync');
   s.textContent = sessions.size > 1 ? `● ${sessions.size} 个标签已连接` : '● 已同步（本地持久化）';
   s.className = 'sync-ok';
+}
+/* 超过 12 秒没发心跳的标签视为已关闭（一次性伪造通道不会心跳，自然被清除） */
+function pruneSessions() {
+  const now = Date.now();
+  for (const sid of sessions) {
+    if (sid !== SESSION && now - (sessionLastSeen[sid] || 0) > 12000) { sessions.delete(sid); delete sessionLastSeen[sid]; }
+  }
 }
 
 /* ---------------- 启动 ---------------- */
@@ -933,50 +1016,57 @@ $('#copy').onclick = async () => {
 };
 $('#exit').onclick = () => { location.hash = ''; showLanding(); };
 
-/* ---------------- 测试钩子（自动化验证用） ---------------- */
-window.__rb = {
-  get state() { return state; },
-  get meId() { return meId; },
-  sessions: () => sessions,
-  setRole(role) { commit(s => { s.members[meId].role = role; }, `成员身份变更：${me().name} → ${ROLE[role]}`, true); pushStatePatch({ members: { [meId]: state.members[meId] } }); },
-  addMember(name, role) {
-    const id = uid('mb');
-    commit(s => { s.members[id] = { id, name, role, joinedAt: Date.now(), lastSeen: Date.now() }; }, `${name} 以${ROLE[role]}身份加入评审`, true);
-    pushStatePatch({ members: { [id]: state.members[id] } });
-    return id;
-  },
-  actAs(id) { meId = id; sessionStorage.setItem(SS_ME + state.id, id); render(); },
-  advance, backStage, undo,
-  gate: gateForNext,
-  place(type, x, y) { tool = type; placeObject(x, y); return selectedId; },
-  setText(id, text) { updateObjectText(id, text); },
-  snapshotObject: id => structuredClone(state.objects[id]),
-  /* 确定性制造冲突：传入“对方编辑前看到的对象快照”与对方的改动 */
-  remoteUpdate(id, baseObj, patch, name = '其他编辑者') {
-    if (!state.members.remote) {
-      commit(s => { s.members.remote = { id: 'remote', name, role: 'editor', joinedAt: Date.now(), lastSeen: Date.now() }; });
-    }
-    const proposed = { ...structuredClone(baseObj), ...patch, version: baseObj.version + 1, verTag: uid('v'), updatedBy: 'remote', updatedTs: Date.now() + 1 };
-    const snap = baseSnapshot();
-    snap.members = { remote: state.members.remote };
-    snap.objects = { [id]: proposed };
-    snap.conflicts = [];
-    handlePatch({ session: 'remote-' + uid('s'), ts: Date.now(), kind: 'patch', by: 'remote', byName: name, patchType: 'object-update', objectId: id, baseTag: baseObj.verTag, verTag: proposed.verTag, proposed, snapshot: snap });
-  },
-  conflicts: () => state.conflicts,
-  openConflict(id) { const cf = state.conflicts.find(c => id ? c.id === id : !c.resolved); if (cf) openConflict(cf); },
-  setMergeText(t) { $('#cf-merge').value = t; },
-  resolve: resolveConflict,
-  addComment(content, opts = {}) {
-    const id = uid('cm');
-    const rec = { id, content, ownerId: opts.ownerId || meId, priority: opts.priority || 'medium', status: opts.status || 'open', by: meId, ts: Date.now(), updatedTs: Date.now(), objectId: opts.objectId || null, evidence: null, evidenceName: null };
-    commit(s => { s.comments[id] = rec; }, `提交意见「${content.slice(0, 16)}…」（负责人：${me().name}，优先级${PRIORITY[rec.priority]}）`);
-    pushStatePatch({ commentId: id });
-    return id;
-  },
-  setStatus(id, st) { changeStatus(state.comments[id], st); },
-  exportPNG,
-  STAGES, STATUS,
-};
+/* ---------------- 测试钩子（仅 ?rbtest=1 时挂载，普通访问完全不存在） ---------------- */
+if (new URLSearchParams(location.search).has('rbtest')) {
+  window.__rb = {
+    get state() { return state; },
+    get meId() { return meId; },
+    sessions: () => sessions,
+    /* 改身份：走与主持人弹窗完全相同的内部路径（观察者调用会被拒） */
+    setRole(role) { changeRole(me(), role); },
+    addMember(name, role) {
+      if (!isHost()) { denyHost('添加成员'); return null; }
+      const id = uid('mb');
+      commit(s => { s.members[id] = { id, name, role, joinedAt: Date.now(), lastSeen: Date.now() }; }, `${name} 以${ROLE[role]}身份加入评审`, true);
+      pushStatePatch({ members: { [id]: state.members[id] }, patchType: 'member-role' });
+      return id;
+    },
+    actAs(id) { meId = id; sessionStorage.setItem(SS_ME + state.id, id); render(); },
+    advance, backStage, undo,
+    gate: gateForNext,
+    place(type, x, y) { tool = type; placeObject(x, y); return selectedId; },
+    setText(id, text) { updateObjectText(id, text); },
+    snapshotObject: id => structuredClone(state.objects[id]),
+    /* 确定性制造冲突：模拟“另一位编辑者”的入站补丁（同样经过授权检查） */
+    remoteUpdate(id, baseObj, patch, name = '其他编辑者') {
+      if (!state.members.remote) {
+        state.members.remote = { id: 'remote', name, role: 'editor', joinedAt: Date.now(), lastSeen: Date.now() };
+      }
+      const proposed = { ...structuredClone(baseObj), ...patch, version: baseObj.version + 1, verTag: uid('v'), updatedBy: 'remote', updatedTs: Date.now() + 1 };
+      const snap = baseSnapshot();
+      snap.objects = { [id]: proposed };
+      snap.conflicts = [];
+      handlePatch({ session: 'remote-' + uid('s'), ts: Date.now(), kind: 'patch', by: 'remote', byName: name, patchType: 'object-update', objectId: id, baseTag: baseObj.verTag, verTag: proposed.verTag, proposed, snapshot: snap });
+    },
+    /* 以“自己的身份”向总线投递任意补丁，用于验证越权补丁会被丢弃 */
+    rawPost(msg) { post({ kind: 'patch', by: meId, byName: me()?.name, snapshot: baseSnapshot(), ...msg }); },
+    conflicts: () => state.conflicts,
+    openConflict(id) { const cf = state.conflicts.find(c => id ? c.id === id : !c.resolved); if (cf) openConflict(cf); },
+    setMergeText(t) { $('#cf-merge').value = t; },
+    resolve: resolveConflict,
+    addComment(content, opts = {}) {
+      if (!canComment()) { denyComment(); return null; }
+      const id = uid('cm');
+      const rec = { id, content, ownerId: opts.ownerId || meId, priority: opts.priority || 'medium', status: opts.status || 'open', by: meId, ts: Date.now(), updatedTs: Date.now(), objectId: opts.objectId || null, evidence: null, evidenceName: null };
+      commit(s => { s.comments[id] = rec; }, `提交意见「${content.slice(0, 16)}…」（负责人：${state.members[rec.ownerId]?.name || me().name}，优先级${PRIORITY[rec.priority]}）`);
+      pushStatePatch({ commentId: id });
+      return id;
+    },
+    setStatus(id, st) { changeStatus(state.comments[id], st); },
+    removeComment(id) { deleteComment(id); },
+    exportPNG,
+    STAGES, STATUS,
+  };
+}
 
 boot();
