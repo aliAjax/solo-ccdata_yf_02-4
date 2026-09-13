@@ -1,0 +1,10 @@
+import { JSDOM } from 'jsdom';
+import fs from 'fs';
+const raw = fs.readFileSync('/workspace/index.html','utf8');
+const appjs = fs.readFileSync('/workspace/app.js','utf8');
+const src = appjs.split('\n').slice(0,60).join('\n');
+const html = raw.replace('<script src="app.js"></script>',`<script>${src}</scr`+`ipt>`);
+const domProbe = new JSDOM(html,{runScripts:'outside-only',url:'http://x/index.html'});
+const ss=[...domProbe.window.document.querySelectorAll('script')];
+console.log('scripts:',ss.length);
+ss.forEach((s,i)=>console.log(i,s.textContent.length, JSON.stringify(s.textContent.slice(0,40)), '...', JSON.stringify(s.textContent.slice(-40))));
